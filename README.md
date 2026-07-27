@@ -10,12 +10,12 @@ $$y = \rho Wy + X\beta(u,v) + \varepsilon,$$
 
 where
 
-- \(y\) is the response variable,
-- \(W\) is the spatial weights matrix,
-- \(\rho\) is the spatial autoregressive parameter,
-- \(X\) is the matrix of explanatory variables,
-- \(\beta(u,v)\) are location-specific regression coefficients,
-- \(\varepsilon\) is the random error.
+- $$y$$ is the response variable,
+- $$W$$ is the spatial weights matrix,
+- $$\rho$$ is the spatial autoregressive parameter,
+- $$X$$ is the matrix of explanatory variables,
+- $$\beta(u,v)$$ are location-specific regression coefficients,
+- $$\varepsilon$$ is the random error.
 
 ---
 
