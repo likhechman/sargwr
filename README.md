@@ -6,9 +6,7 @@ SARGWR combines the advantages of the Spatial Autoregressive (SAR) model and Geo
 
 The current Geographically Weighted Regression - Saptial Lag model is defined as
 
-\[
-y = \rho Wy + X\beta(u,v) + \varepsilon,
-\]
+$$y = \rho Wy + X\beta(u,v) + \varepsilon,$$
 
 where
 
