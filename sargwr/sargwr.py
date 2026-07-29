@@ -4,7 +4,7 @@ import numpy as np
 
 from copy import deepcopy
 
-from scipy.stats import t, norm
+from scipy.stats import t, norm, chi2
 from scipy.linalg import eigh
 from scipy.optimize import minimize_scalar
 
@@ -21,7 +21,7 @@ class GWR_SL:
     def __init__(
         self, kernel='gaussian', family='gaussian', selector='golden', 
         selector_metric='AICc', n_jobs=1, fixed=False, use_coords=True, spherical=False, 
-        intercept=True, verbose=False
+        intercept=True, verbose=False, compute_deep_statistics=True
     ):
         '''
         Initialize a Geographically Weighted Regression Spatial Lag model.
@@ -64,6 +64,10 @@ class GWR_SL:
 
         verbose : bool, default=False
             If True, print model information during fitting.
+        
+        compute_deep_statistics : bool, default=True
+            If True computes local and other statistics that isn't nesseccary for AIC, 
+            AICc or BIC evaluation.
         '''   
         self.kernel = kernel.lower()
         self.family = family.lower()
@@ -75,8 +79,8 @@ class GWR_SL:
         self.spherical = spherical
         self.intercept = intercept
         self.verbose = verbose
+        self.compute_deep_statistics = compute_deep_statistics
 
-        self.final_bw_selected = True
         self.distance_matrix = None
 
     def _add_intercept(self, X):
@@ -91,7 +95,7 @@ class GWR_SL:
 
         return X
 
-    def _bandwidth_objective(self, bandwidth):
+    def _bandwidth_objective(self, bandwidth, model=None):
         '''
         Evaluate the objective function used for bandwidth selection.
 
@@ -111,16 +115,16 @@ class GWR_SL:
         '''
         if not self.fixed:
             bandwidth = int(round(bandwidth))
-        self.fit(
+        model.fit(
             self.coords, self.y, self.X, bandwidth=bandwidth, W=self.W, 
             rho_tolerance=self.rho_tolerance
         )
         if self.selector_metric == 'aic':
-            return self.aic
+            return model.aic
         if self.selector_metric == 'aicc':
-            return self.aicc
+            return model.aicc
         if self.selector_metric == 'bic':
-            return self.bic
+            return model.bic
     
     def _select_bandwidth(self):
         '''
@@ -140,7 +144,9 @@ class GWR_SL:
         if self.verbose:
             print('Selecting bandwidth')
         
-        self.final_bw_selected = False
+        model = deepcopy(self)
+        model.verbose = False
+        model.compute_deep_statistics = False
 
         if self.bandwidth_interval is None:
             if self.fixed:
@@ -158,15 +164,14 @@ class GWR_SL:
             upper = self.bandwidth_interval[1]
 
         if self.selector == 'golden':
+            bandwidth_objective = lambda bandwidth: self._bandwidth_objective(bandwidth, model=model)
             result = minimize_scalar(
-                self._bandwidth_objective,
+                bandwidth_objective,
                 bounds=(lower, upper),
                 method='bounded',
 
             )
-            bandwidth = int(round(result.x))
-            self.final_bw_selected = True
-            return bandwidth
+            best_bandwidth = int(round(result.x))
         elif self.selector == 'interval':
             bandwidths = range(lower, upper + 1)
             scores = Parallel(n_jobs=self.n_jobs)(
@@ -178,10 +183,9 @@ class GWR_SL:
                 )
             )
             best_bandwidth = bandwidths[np.argmin(scores)]
-            self.final_bw_selected = True
-            return best_bandwidth
         else:
             raise ValueError('Unsuported selector for bandwidth')
+        return best_bandwidth
     
     def _compute_local_weights(self, bandwidth):
         '''
@@ -202,13 +206,10 @@ class GWR_SL:
             List containing one diagonal weight matrix of shape (n, n) for each
             observation.
         '''
-        if self.verbose and self.final_bw_selected:
+        if self.verbose:
             print('Compute local weights')
-        K = Kernel(
-            self.coords, bandwidth, distance_matrix=self.distance_matrix,
-            function=self.kernel, fixed=self.fixed, spherical=self.spherical
-        )
-        Wis = [K.get_Wi(i) for i in range(self.n)]
+        self.Kernel.bandwidth = bandwidth
+        Wis = [self.Kernel.get_Wi(i) for i in range(self.n)]
         return Wis
 
     def _compute_hat_matrix(self):
@@ -247,6 +248,35 @@ class GWR_SL:
         ])
         local_ps = 2 * (1 - t.cdf(np.abs(local_ts), df=self.df))
         return local_ts, local_ps
+
+    def _compute_lm_test(self):
+        '''
+        Compute Lagrange Multiplier test for spatial lag dependence.
+
+        Returns
+        -------
+        float
+            LM statistic.
+
+        float
+            P-value.
+        '''
+
+        y_star = self.y
+
+        betas = np.asarray([estimate_local_betas(y_star, self.X, Wi)[0] for Wi in self.Wis])
+        y_hat = np.array([np.dot(self.X[i], betas[i]) for i in range(self.n)]).reshape(-1, 1)
+        e = y_star - y_hat
+
+        sigma2 = float(np.dot(e.T, e) / self.n)
+        We = np.dot(self.W, e)
+        num = float(np.dot(e.T, We) ** 2)
+
+        den = sigma2 ** 2 * np.trace(np.dot(self.W.T, self.W) + np.dot(self.W, self.W))
+        LM = num / den
+        p = 1.0 - chi2.cdf(LM, 1)
+
+        return LM, p
     
     def _compute_diagnostics(self):
         '''
@@ -265,7 +295,7 @@ class GWR_SL:
         which is consistent with maximum likelihood estimation for the spatial lag
         model.
         '''
-        if self.verbose and self.final_bw_selected:
+        if self.verbose:
             print('Compute diagnostics')
 
         self.rss = float(np.dot(self.residuals.T, self.residuals))
@@ -291,14 +321,27 @@ class GWR_SL:
         )
         self.bic = -2 * self.loglik + np.log(self.n) * self.trace_S
 
-        if self.final_bw_selected:
+        if self.compute_deep_statistics:
             ll0 = estimate_log_likelihood(self.y, self.X, self.Wis, self.W, self.rho, self.n_jobs)
             ll1 = estimate_log_likelihood(self.y, self.X, self.Wis, self.W, self.rho + self.rho_tolerance, self.n_jobs)
             ll2 = estimate_log_likelihood(self.y, self.X, self.Wis, self.W, self.rho - self.rho_tolerance, self.n_jobs)
             second = (ll1 - 2 * ll0 + ll2) / self.rho_tolerance**2
-            self.se_rho = np.sqrt(1 / second)
-            z = self.rho / self.se_rho
-            self.p_rho = 2 * (1 - norm.cdf(abs(z)))
+
+            if second <= 0 or not np.isfinite(second):
+                self.se_rho = np.nan
+                self.wald_z = np.nan
+                self.wald_p_rho = np.nan
+            else:
+                self.se_rho = np.sqrt(1 / second)
+                self.wald_z = self.rho / self.se_rho
+                self.wald_p_rho = 2 * (1 - norm.cdf(abs(self.wald_z)))
+
+            ll_full = self.loglik
+            ll_restricted = -estimate_log_likelihood(self.y, self.X, self.Wis, self.W, 0, self.n_jobs)
+            self.lr = 2 * (ll_full - ll_restricted)
+            self.lr_pvalue = 1.0 - chi2.cdf(self.lr, df=1)
+
+            self.lm, self.lm_pvalue = self._compute_lm_test()
 
             alphas = np.array([.1, .05, .001])
             self.alpha_adj = (alphas * self.p) / self.trace_S
@@ -396,8 +439,11 @@ class GWR_SL:
         if self.distance_matrix is None:
             if self.verbose:
                 print('Compute distance matrix')
-            self.distance_matrix = Kernel(
-                self.coords, 1, spherical=self.spherical).compute_distance_matrix()
+            self.Kernel = Kernel(
+                self.coords, 1, function=self.kernel, 
+                fixed=self.fixed, spherical=self.spherical
+            )
+            self.distance_matrix = self.Kernel.compute_distance_matrix()
 
         if self.intercept:
             self.X = self._add_intercept(self.X)
@@ -435,7 +481,7 @@ class GWR_SL:
             raise ValueError('W must be the same length as X and y')
 
         if self.family == 'gaussian':
-            if self.verbose and self.final_bw_selected:
+            if self.verbose:
                 print('Estimating rho')
             self.rho = estimate_rho(
                 self.y, self.X, self.Wis, self.W, self.n_jobs, 
@@ -443,7 +489,7 @@ class GWR_SL:
             )
             self.y_star = get_y_star(self.y, self.W, self.rho)
 
-            if self.verbose and self.final_bw_selected:
+            if self.verbose:
                 print('Estimating local betas')
             results = Parallel(n_jobs=self.n_jobs)(
                 delayed(estimate_local_betas)(self.y_star, self.X, Wi)
@@ -460,7 +506,7 @@ class GWR_SL:
             self.residuals = self.y_star - self.y_hat
 
             self._compute_diagnostics()
-            if self.final_bw_selected:
+            if self.compute_deep_statistics:
                 self.local_ts, self.local_ps = self._compute_local_stastics()
         else:
             raise ValueError('Unsupported family type', self.family)
@@ -554,7 +600,6 @@ class GWR_SL:
 
             corr = np.corrcoef(Xw, rowvar=False)
             local_corr[i] = corr
-
 
             for j in range(self.p):
                 y = Xw[:, j]
@@ -741,7 +786,7 @@ class GWR_SL:
             )
 
         lines.append('=' * 104)
-        lines.append('Spatial Autoregressive Geographically Weighted Regression')
+        lines.append('Geographically Weighted Regression - Spatial Lag model')
         lines.append('=' * 104)
 
         section('Model Information')
@@ -753,9 +798,6 @@ class GWR_SL:
 
         two_col('Kernel', self.kernel,
                 'Bandwidth', bw)
-
-        two_col('Spatial lag rho', f'{self.rho:.6f}',
-                'P-value (rho)', f'{self.p_rho:.6f}')
 
         section('Model Diagnostics')
 
@@ -832,5 +874,19 @@ class GWR_SL:
                 f'{np.median(beta):15.6f}'
                 f'{np.max(beta):15.6f}'
             )
+
+        section('Statistics for autoregressive coefficient ρ')
+
+        two_col('Value', f'{self.rho:.6f}',
+                'Standard error', f'{self.se_rho:.6f}')
+        
+        two_col('Wald test z-statistic', f'{self.wald_z:.6f}',
+                'Wald test p-value', f'{self.wald_p_rho:.6f}')
+        
+        two_col('Likelihood ratio', f'{self.lr:.6f}',
+                'Likelihood ratio p-value', f'{self.lr_pvalue:.6f}')
+
+        two_col('Lagrange Multiplier statistic', f'{self.lm:.6f}',
+                'Lagrange Multiplier p-value', f'{self.lm_pvalue:.6f}')
 
         return '\n'.join(lines)
