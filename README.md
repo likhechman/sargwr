@@ -21,7 +21,6 @@ where
 
 ## Features
 
-- Spatial autoregressive geographically weighted regression
 - Fixed and adaptive bandwidths
 - Multiple kernel functions
     - Gaussian
@@ -48,6 +47,7 @@ where
 - Local coefficient estimates
 - Local t-values
 - Local significance filtering
+- Monte Carlo test for spatial variability
 
 ---
 
