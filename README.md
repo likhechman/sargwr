@@ -78,6 +78,8 @@ model.fit(coords, y, X, W=W)
 print(model.summary())
 ```
 
+You can find test implementation in notebooks.
+
 ---
 
 ## Bandwidth Selection
