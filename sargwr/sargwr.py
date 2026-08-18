@@ -362,6 +362,76 @@ class GWR_SL:
                 * np.maximum(self.leverage, 1e-12)
                 / (self.p * (1.0 - np.maximum(self.leverage, 1e-12)))
             )
+    
+    def compute_spillovers(self):
+        '''
+        Compute direct, indirect, and total spatial effects for each
+        local coefficient.
+
+        The spatial multiplier is defined as
+
+            (I - rho W)^(-1)
+
+        and the marginal effect matrix for coefficient j is
+
+            (I - rho W)^(-1) @ diag(beta_j).
+
+        For each coefficient, the reported effects are:
+
+        Direct effect
+            Mean of the diagonal elements of the marginal effect matrix.
+
+        Total effect
+            Mean of all elements of the marginal effect matrix.
+
+        Indirect effect
+            Total effect minus direct effect.
+
+        Returns
+        -------
+        dict
+            Dictionary containing direct, indirect, and total effects.
+        '''
+
+        if not hasattr(self, 'rho'):
+            raise ValueError(
+                'Model must be fitted before computing spillovers.'
+            )
+
+        if not hasattr(self, 'betas'):
+            raise ValueError(
+                'Local coefficients have not been estimated.'
+            )
+
+        I = np.eye(self.n)
+        multiplier = np.linalg.inv(I - self.rho * self.W)
+
+        direct = np.zeros(self.p)
+        indirect = np.zeros(self.p)
+        total = np.zeros(self.p)
+
+        effects = []
+
+        for j in range(self.p):
+
+            beta_j = np.asarray(self.betas[:, j]).ravel()
+            B_j = np.diag(beta_j)
+            M_j = np.dot(multiplier, B_j)
+            direct_j = np.mean(np.diag(M_j))
+            total_j = np.mean(np.sum(M_j, axis=1))
+
+            indirect_j = (total_j - direct_j)
+
+            direct[j] = direct_j
+            total[j] = total_j
+            indirect[j] = indirect_j
+
+            effects.append(M_j)
+
+        self.direct_effects = direct
+        self.indirect_effects = indirect
+        self.total_effects = total
+        self.effects = effects
 
     def fit(
         self, coords, y, X, W=None, bandwidth=None, variable_names=None, 
@@ -508,6 +578,7 @@ class GWR_SL:
             self._compute_diagnostics()
             if self.compute_deep_statistics:
                 self.local_ts, self.local_ps = self._compute_local_stastics()
+                self.compute_spillovers()
         else:
             raise ValueError('Unsupported family type', self.family)
 
@@ -888,5 +959,25 @@ class GWR_SL:
 
         two_col('Lagrange Multiplier statistic', f'{self.lm:.6f}',
                 'Lagrange Multiplier p-value', f'{self.lm_pvalue:.6f}')
+
+        section('Spatial Effects')
+
+        lines.append(
+            f'{"Variable":<32}'
+            f'{"Direct":>24}'
+            f'{"Indirect":>24}'
+            f'{"Total":>24}'
+        )
+
+        lines.append('-' * 104)
+
+        for j, name in enumerate(self.variable_names):
+
+            lines.append(
+                f'{name:<32}'
+                f'{self.direct_effects[j]:24.6f}'
+                f'{self.indirect_effects[j]:24.6f}'
+                f'{self.total_effects[j]:24.6f}'
+            )
 
         return '\n'.join(lines)
