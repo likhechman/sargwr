@@ -4,18 +4,22 @@ Spatial Autoregressive Geographically Weighted Regression (SARGWR) implemented i
 
 SARGWR combines the advantages of the Spatial Autoregressive (SAR) model and Geographically Weighted Regression (GWR) by accounting for both spatial dependence in the response variable and spatial heterogeneity in regression coefficients.
 
+Currently sargwr package supports Geographically Weighted Regression - Saptial Lag model and Multiscale Geographically Weighted Regression - Saptial Lag model.
+
 The current Geographically Weighted Regression - Saptial Lag model is defined as
 
 $$y = \rho Wy + X\beta(u,v) + \varepsilon,$$
 
-where
+where:
 
-- $$y$$ is the response variable,
-- $$W$$ is the spatial weights matrix,
-- $$\rho$$ is the spatial autoregressive parameter,
-- $$X$$ is the matrix of explanatory variables,
-- $$\beta(u,v)$$ are location-specific regression coefficients,
-- $$\varepsilon$$ is the random error.
+- $y$ is the response variable,
+- $W$ is the spatial weights matrix,
+- $\rho$ is the spatial autoregressive parameter,
+- $X$ is the matrix of explanatory variables,
+- $\beta(u,v)$ are location-specific regression coefficients,
+- $\varepsilon$ is the random error.
+
+For Multiscale Geographically Weighted Regression - Saptial Lag model spatial weights matrix is unique for each explanatory variables.
 
 ---
 
@@ -36,17 +40,7 @@ where
 - Euclidean and spherical distances
 - Parallel estimation
 - Model diagnostics
-    - RSS
-    - R²
-    - Adjusted R²
-    - AIC
-    - AICc
-    - BIC
-    - Log-likelihood
-    - Effective degrees of freedom
-- Local coefficient estimates
-- Local t-values
-- Local significance filtering
+- Multicollinearity tests
 - Monte Carlo test for spatial variability
 
 ---
@@ -56,7 +50,7 @@ where
 Clone the repository
 
 ```bash
-git clone https://github.com/likhechman/sargwr.git
+git clone https://github.com/yourusername/sargwr.git
 ```
 
 Install dependencies
@@ -72,7 +66,7 @@ pip install numpy scipy joblib
 ```python
 from sargwr import GWR_SL
 
-model = GWR_SL(kernel='bisquare')
+model = GWR_SL()
 model.fit(coords, y, X, W=W)
 
 print(model.summary())
