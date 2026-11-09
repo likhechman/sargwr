@@ -50,7 +50,7 @@ For Multiscale Geographically Weighted Regression - Saptial Lag model spatial we
 Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/sargwr.git
+git clone https://github.com/likhechman/sargwr.git
 ```
 
 Install dependencies
