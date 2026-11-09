@@ -5,10 +5,10 @@ Python implementation of the Spatial Autoregressive Geographically
 Weighted Regression model.
 '''
 
-from .sargwr import GWR_SL
+from .sargwr import GWR_SL, MGWR_SL
 
-__version__ = '0.1.1'
+__version__ = '0.2.0'
 __author__ = 'Alexandra Kaluzhak'
 __license__ = 'MIT'
 
-__all__ = ['GWR_SL']
+__all__ = ['GWR_SL', 'MGWR_SL']

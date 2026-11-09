@@ -1,5 +1,6 @@
 __author__ = 'Alexandra Kaluzhak'
 
+from tabnanny import verbose
 import numpy as np
 
 from copy import deepcopy
@@ -13,6 +14,7 @@ from joblib import Parallel, delayed
 
 from .estimators import *
 from .kernels import *
+from .utils import *
 
 import warnings 
 warnings.filterwarnings('ignore')
@@ -83,18 +85,6 @@ class GWR_SL:
 
         self.distance_matrix = None
 
-    def _add_intercept(self, X):
-        '''
-        Add an intercept column to the design matrix.
-        '''
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
-
-        if not np.allclose(X[:, 0], 1):
-            X = np.column_stack((np.ones(X.shape[0]), X))
-
-        return X
-
     def _bandwidth_objective(self, bandwidth, model=None):
         '''
         Evaluate the objective function used for bandwidth selection.
@@ -121,10 +111,12 @@ class GWR_SL:
         )
         if self.selector_metric == 'aic':
             return model.aic
-        if self.selector_metric == 'aicc':
+        elif self.selector_metric == 'aicc':
             return model.aicc
-        if self.selector_metric == 'bic':
+        elif self.selector_metric == 'bic':
             return model.bic
+        else:
+            raise ValueError("selector_metric must be 'aic', 'aicc', or 'bic'.")
     
     def _select_bandwidth(self):
         '''
@@ -157,9 +149,7 @@ class GWR_SL:
                 upper = self.n - 1
         else:
             if len(self.bandwidth_interval) != 2:
-                raise ValueError(
-                    'bandwidth_interval must be None or contain exactly two values.'
-                    )
+                raise ValueError('bandwidth_interval must be None or contain exactly two values.')
             lower = self.bandwidth_interval[0]
             upper = self.bandwidth_interval[1]
 
@@ -169,7 +159,6 @@ class GWR_SL:
                 bandwidth_objective,
                 bounds=(lower, upper),
                 method='bounded',
-
             )
             best_bandwidth = int(round(result.x))
         elif self.selector == 'interval':
@@ -184,7 +173,7 @@ class GWR_SL:
             )
             best_bandwidth = bandwidths[np.argmin(scores)]
         else:
-            raise ValueError('Unsuported selector for bandwidth')
+            raise ValueError(f'Unsupported selector for bandwidth: {self.selector}')
         return best_bandwidth
     
     def _compute_local_weights(self, bandwidth):
@@ -264,7 +253,7 @@ class GWR_SL:
 
         y_star = self.y
 
-        betas = np.asarray([estimate_local_betas(y_star, self.X, Wi)[0] for Wi in self.Wis])
+        betas = np.asarray([estimate_gwr_betas(y_star, self.X, Wi)[0] for Wi in self.Wis])
         y_hat = np.array([np.dot(self.X[i], betas[i]) for i in range(self.n)]).reshape(-1, 1)
         e = y_star - y_hat
 
@@ -363,7 +352,7 @@ class GWR_SL:
                 / (self.p * (1.0 - np.maximum(self.leverage, 1e-12)))
             )
     
-    def compute_spillovers(self):
+    def _compute_spillovers(self):
         '''
         Compute direct, indirect, and total spatial effects for each
         local coefficient.
@@ -392,19 +381,7 @@ class GWR_SL:
         dict
             Dictionary containing direct, indirect, and total effects.
         '''
-
-        if not hasattr(self, 'rho'):
-            raise ValueError(
-                'Model must be fitted before computing spillovers.'
-            )
-
-        if not hasattr(self, 'betas'):
-            raise ValueError(
-                'Local coefficients have not been estimated.'
-            )
-
-        I = np.eye(self.n)
-        multiplier = np.linalg.inv(I - self.rho * self.W)
+        multiplier = np.linalg.inv(self.I - self.rho * self.W)
 
         direct = np.zeros(self.p)
         indirect = np.zeros(self.p)
@@ -413,7 +390,6 @@ class GWR_SL:
         effects = []
 
         for j in range(self.p):
-
             beta_j = np.asarray(self.betas[:, j]).ravel()
             B_j = np.diag(beta_j)
             M_j = np.dot(multiplier, B_j)
@@ -516,36 +492,20 @@ class GWR_SL:
             self.distance_matrix = self.Kernel.compute_distance_matrix()
 
         if self.intercept:
-            self.X = self._add_intercept(self.X)
-
+            self.X = add_intercept(self.X)
         self.n = self.X.shape[0]
         self.p = self.X.shape[1]
         self.I = np.identity(self.n)
 
+        self.variable_names = get_variable_names(variable_names, self.p, self.intercept)
+
         if bandwidth is None:
             self.bandwidth = self._select_bandwidth()
         else:
-            self.bandwidth = bandwidth
-
-        if variable_names is None:
-            self.variable_names = [f'X{i}' for i in range(self.p)]
-        else:
-            self.variable_names = variable_names
-            if self.intercept:
-                self.variable_names.insert(0, 'Intercept')
+            self.bandwidth = validate_bandwidth(bandwidth, self.fixed, self.n, self.p)
 
         self.Wis = self._compute_local_weights(self.bandwidth)
-
-        if self.use_coords:
-            self.W = np.array([np.diag(Wi) for Wi in self.Wis])
-        else:
-            if self.W is None:
-                raise ValueError('Provide W or set use_coords to True')
-            else:
-                if hasattr(W, 'full'):
-                    self.W = W.full()[0]
-                else:
-                    self.W = np.asarray(W)
+        self.W = get_W(W, self.Wis, self.use_coords, self.n)
 
         if (len(self.W) != len(self.y)) or (len(self.W) != len(self.X)):
             raise ValueError('W must be the same length as X and y')
@@ -558,11 +518,12 @@ class GWR_SL:
                 rho_tolerance=self.rho_tolerance
             )
             self.y_star = get_y_star(self.y, self.W, self.rho)
+            self.beta_global = np.linalg.lstsq(self.X, self.y_star.ravel(), rcond=None)[0]
 
             if self.verbose:
                 print('Estimating local betas')
             results = Parallel(n_jobs=self.n_jobs)(
-                delayed(estimate_local_betas)(self.y_star, self.X, Wi)
+                delayed(estimate_gwr_betas)(self.y_star, self.X, Wi)
                 for Wi in self.Wis
             )
             betas, XtWiX_XtWis, XtWiX_invs = zip(*results)
@@ -578,7 +539,7 @@ class GWR_SL:
             self._compute_diagnostics()
             if self.compute_deep_statistics:
                 self.local_ts, self.local_ps = self._compute_local_stastics()
-                self.compute_spillovers()
+                self._compute_spillovers()
         else:
             raise ValueError('Unsupported family type', self.family)
 
@@ -764,7 +725,7 @@ class GWR_SL:
     
     def predict(self, coords_new=None, X_new=None):
         '''
-        Predict fitted values from a fitted SARGWR model.
+        Predict fitted values from a fitted model.
 
         Parameters
         ----------
@@ -825,7 +786,7 @@ class GWR_SL:
         preds = [
             np.dot(
                 X_new[i], 
-                estimate_local_betas(self.y_star, self.X, K_predict.get_Wi(i))[0]
+                estimate_gwr_betas(self.y_star, self.X, K_predict.get_Wi(i))[0]
             ) for i in range(m)
         ] 
         preds = np.asarray(preds)
@@ -861,64 +822,35 @@ class GWR_SL:
         lines.append('=' * 104)
 
         section('Model Information')
-
         bw = f'{"Fixed" if self.fixed else "Adaptive"} {self.bandwidth}'
-
         two_col('Number of observations', self.n,
                 'Number of predictors', self.p)
-
         two_col('Kernel', self.kernel,
                 'Bandwidth', bw)
 
         section('Model Diagnostics')
-
         two_col('Residual sum of squares', f'{self.rss:.6f}',
                 'Sigma²', f'{self.sigma2:.6f}')
-
         two_col('Log-likelihood', f'{self.loglik:.6f}',
                 'AIC', f'{self.aic:.6f}')
-
         two_col('AICc', f'{self.aicc:.6f}',
                 'BIC', f'{self.bic:.6f}')
-
         two_col('R²', f'{self.r2:.6f}',
                 'Adjusted R²', f'{self.adj_r2:.6f}')
-
         two_col('trace(S)', f'{self.trace_S:.6f}',
                 'Degrees of freedom', f'{self.df:.6f}')
-
-        two_col('Adjusted α (95%)',
-                f'{self.alpha_adj[1]:.6f}')
+        two_col('Adjustes critical t-value', f'{self.critical:.6f}',
+                'Adjusted α (95%)', f'{self.alpha_adj[1]:.6f}')
 
         section('Residual Diagnostics')
-
-        two_col(
-            'Mean residual',
-            f'{np.mean(self.residuals):.6f}',
-            'Std. residual',
-            f'{np.std(self.residuals, ddof=1):.6f}'
-        )
-
-        two_col(
-            'Mean leverage',
-            f'{np.mean(self.leverage):.6f}',
-            'Maximum leverage',
-            f'{np.max(self.leverage):.6f}'
-        )
-
-        two_col(
-            'Mean Cook\'s distance',
-            f'{np.mean(self.cooks_distance):.6f}',
-            'Maximum Cook\'s distance',
-            f'{np.max(self.cooks_distance):.6f}'
-        )
-
-        two_col(
-            'Mean |studentized residual|',
-            f'{np.mean(np.abs(self.studentized_residuals)):.6f}',
-            'Maximum |studentized residual|',
-            f'{np.max(np.abs(self.studentized_residuals)):.6f}'
-        )
+        two_col('Mean residual', f'{np.mean(self.residuals):.6f}',
+                'Std. residual', f'{np.std(self.residuals, ddof=1):.6f}')
+        two_col('Mean leverage', f'{np.mean(self.leverage):.6f}',
+                'Maximum leverage', f'{np.max(self.leverage):.6f}')
+        two_col('Mean Cook\'s distance', f'{np.mean(self.cooks_distance):.6f}',
+                'Maximum Cook\'s distance', f'{np.max(self.cooks_distance):.6f}')
+        two_col('Mean |studentized residual|', f'{np.mean(np.abs(self.studentized_residuals)):.6f}',
+                'Maximum |studentized residual|', f'{np.max(np.abs(self.studentized_residuals)):.6f}')
 
         section('Summary Statistics for Local Coefficients')
 
@@ -950,13 +882,869 @@ class GWR_SL:
 
         two_col('Value', f'{self.rho:.6f}',
                 'Standard error', f'{self.se_rho:.6f}')
-        
         two_col('Wald test z-statistic', f'{self.wald_z:.6f}',
                 'Wald test p-value', f'{self.wald_p_rho:.6f}')
-        
         two_col('Likelihood ratio', f'{self.lr:.6f}',
                 'Likelihood ratio p-value', f'{self.lr_pvalue:.6f}')
+        two_col('Lagrange Multiplier statistic', f'{self.lm:.6f}',
+                'Lagrange Multiplier p-value', f'{self.lm_pvalue:.6f}')
 
+        section('Spatial Effects')
+
+        lines.append(
+            f'{"Variable":<32}'
+            f'{"Direct":>24}'
+            f'{"Indirect":>24}'
+            f'{"Total":>24}'
+        )
+
+        lines.append('-' * 104)
+
+        for j, name in enumerate(self.variable_names):
+
+            lines.append(
+                f'{name:<32}'
+                f'{self.direct_effects[j]:24.6f}'
+                f'{self.indirect_effects[j]:24.6f}'
+                f'{self.total_effects[j]:24.6f}'
+            )
+
+        return '\n'.join(lines)
+
+class MGWR_SL(GWR_SL):
+    def __init__(
+        self, kernel='gaussian', family='gaussian', selector='golden', 
+        selector_metric='AICc', n_jobs=1, fixed=False, use_coords=True, spherical=False, 
+        intercept=True, verbose=False, compute_deep_statistics=True,
+    ):
+        '''
+        Initialize a Multiscale Geographically Weighted Regression Spatial Lag model.
+
+        Parameters
+        ----------
+        kernel : str, default='gaussian'
+            Kernel function used to compute geographical weights. Supported values are
+            'gaussian', 'bisquare', and 'exponential'.
+
+        family : str, default='gaussian'
+            Probability distribution of the response variable. Currently only
+            'gaussian' is supported.
+
+        selector : str, default='golden'
+            Bandwidth selection method. Supported values are 'golden' for Golden
+            section search and 'interval' for interval search.
+
+        selector_metric : str, default='AICc'
+            Model selection criterion used for bandwidth optimization. Supported values
+            are 'AIC', 'AICc', and 'BIC'.
+
+        n_jobs : int, default=1
+            Number of parallel jobs used during local coefficient estimation. A value
+            of -1 uses all available CPU cores.
+
+        fixed : bool, default=False
+            If True, use a fixed (distance-based) bandwidth. Otherwise, use an adaptive
+            bandwidth defined by the number of nearest neighbours.
+
+        use_coords : bool, default=True
+            If True, construct the spatial weights matrix from the supplied geographic
+            coordinates. Otherwise, use the user-provided spatial weights matrix `W`.
+
+        spherical : bool, default=False
+            If True, compute great-circle distances for geographic coordinates.
+
+        intercept : bool, default=True
+            If True, automatically add an intercept column to the design matrix.
+
+        verbose : bool, default=False
+            If True, print model information during fitting.
+        
+        compute_deep_statistics : bool, default=True
+            If True computes local and other statistics that isn't nesseccary for AIC, 
+            AICc or BIC evaluation.
+        '''   
+        self.kernel = kernel.lower()
+        self.family = family.lower()
+        self.selector = selector.lower()
+        self.selector_metric = selector_metric.lower()
+        self.n_jobs = n_jobs
+        self.fixed = fixed
+        self.use_coords = use_coords
+        self.spherical = spherical
+        self.intercept = intercept
+        self.verbose = verbose
+        self.compute_deep_statistics = compute_deep_statistics
+
+        self.distance_matrix = None
+
+    def _compute_variable_weights(self, bandwidths):
+        '''
+        Compute variable-specific local weighting matrices.
+
+        Returns
+        -------
+        Wis : list
+            Wis[j][i] is the local weighting matrix for regressor j
+            at observation i.
+        '''
+        if self.verbose:
+            print('Compute variable-specific local weights')
+
+        Wis = []
+        for bandwidth in bandwidths:
+            self.Kernel.bandwidth = bandwidth
+            Wis.append(
+                [self.Kernel.get_Wi(i) for i in range(self.n)]
+            )
+        Wis = np.asarray(Wis)
+        return Wis
+
+    def _compute_lm_test(self):
+        '''
+        Compute Lagrange Multiplier test for spatial lag dependence.
+
+        Returns
+        -------
+        float
+            LM statistic.
+
+        float
+            P-value.
+        '''
+
+        y_star = self.y
+
+        betas = estimate_mgwr_betas(
+            y_star, self.X, self.Wis, self.max_iter, self.backfitting_tol, self.n_jobs
+        )
+        y_hat = np.array([np.dot(self.X[i], betas[i]) for i in range(self.n)]).reshape(-1, 1)
+        e = y_star - y_hat
+
+        sigma2 = float(np.dot(e.T, e) / self.n)
+        We = np.dot(self.W, e)
+        num = float(np.dot(e.T, We) ** 2)
+
+        den = sigma2 ** 2 * np.trace(np.dot(self.W.T, self.W) + np.dot(self.W, self.W))
+        LM = num / den
+        p = 1.0 - chi2.cdf(LM, 1)
+
+        return LM, p
+
+    def _compute_hat_matrix(self):
+        '''
+        Approximate MGWR hat matrix.
+
+        For each observation i, the diagonal of the smoothing
+        contribution for coefficient j is calculated from the
+        variable-specific weighted least-squares regression.
+        '''
+        S = np.zeros((self.n, self.n))
+        for i in range(self.n):
+            for j in range(self.p):
+                Xj = self.X[:, j]
+                w = np.diag(self.Wis[j][i])
+
+                denominator = np.sum(w * Xj ** 2)
+                if denominator > 1e-12:
+                    local_beta_weights = (Xj * w / denominator)
+                    S[i, :] += (Xj[i] * local_beta_weights)
+        return S
+
+    def _compute_local_stastics(self):
+        '''
+        Compute local t-values and p-values.
+
+        Returns
+        -------
+        local_ts : ndarray
+            List containing local t-values of shape (n, p) for each observation.
+        local_ps : ndarray
+            List containing local p-values of shape (n, p) for each observation.
+        '''
+        local_ts = np.zeros((self.n, self.p))
+        local_ps = np.zeros((self.n, self.p))
+
+        for j in range(self.p):
+            Xj = self.X[:, j]
+            for i in range(self.n):
+                w = np.diag(self.Wis[j][i])
+                denominator = np.sum(w * (Xj ** 2))
+                if denominator <= 1e-12:
+                    local_ts[i, j] = np.nan
+                    local_ps[i, j] = np.nan
+                    continue
+
+                XtWiX_inv = 1.0 / denominator
+                se = np.sqrt(self.sigma2 * XtWiX_inv)
+                local_ts[i, j] = (self.betas[i, j] / se)
+
+            local_ps[:, j] = 2.0 * (1.0 - t.cdf(np.abs(local_ts[:, j]), df=self.df_j[j]))
+
+        self.local_ts = local_ts
+        self.local_ps = local_ps
+
+        return local_ts, local_ps
+
+    def _compute_variable_enp(self):
+        ENP_j = np.zeros(self.p)
+        for j in range(self.p):
+            Xj = self.X[:, j]
+            for i in range(self.n):
+                w = np.diag(self.Wis[j][i])
+                denominator = np.sum(w * (Xj ** 2))
+                if denominator > 1e-12:
+                    ENP_j[j] += (w[i] * Xj[i] ** 2 / denominator)
+        return ENP_j
+
+    def _compute_adjusted_t_values(self):
+        ENP_j = self._compute_variable_enp()
+        total_enp = np.sum(ENP_j)
+
+        alpha_adj_j = (0.05 * ENP_j / total_enp)
+        df_j = (self.n - ENP_j)
+        critical_t_j = t.ppf(1.0 - alpha_adj_j / 2.0, df_j)
+
+        return ENP_j, critical_t_j, alpha_adj_j, df_j
+
+    def _compute_diagnostics(self):
+        '''
+        Compute diagnostics for the fitted MGWR-SL model.
+        '''
+
+        if self.verbose:
+            print('Compute diagnostics')
+
+        self.rss = float(np.dot(self.residuals.T, self.residuals))
+        self.sigma2 = float(self.rss / self.n)
+
+        sign, logdet = np.linalg.slogdet(self.I - self.rho * self.W)
+        self.loglik = float(
+            logdet
+            - (self.n / 2.0)
+            * (np.log(2.0 * np.pi * self.sigma2) + 1.0)
+        )
+        self.tss = float(np.sum((self.y - np.mean(self.y))**2))
+        self.S = self._compute_hat_matrix()
+        self.trace_S = float(np.trace(self.S))
+        self.df = self.n - self.trace_S
+
+        self.r2 = 1.0 - self.rss / self.tss
+        self.adj_r2 = 1 - (self.rss / self.df) / (self.tss / (self.n - 1))
+
+        self.aic = -2 * self.loglik + 2 * self.trace_S
+        self.aicc = (
+            self.aic + (2 * self.trace_S * (self.trace_S + 1)) / (self.n - self.trace_S - 1)
+        )
+        self.bic = -2 * self.loglik + np.log(self.n) * self.trace_S
+
+        if self.compute_deep_statistics:
+            ll0 = estimate_log_likelihood(
+                self.y, self.X, self.Wis, self.W, self.rho, self.n_jobs, 
+                True, self.max_iter, self.backfitting_tol
+            )
+            ll1 = estimate_log_likelihood(
+                self.y, self.X, self.Wis, self.W, self.rho + self.rho_tolerance, self.n_jobs,
+                True, self.max_iter, self.backfitting_tol
+            )
+            ll2 = estimate_log_likelihood(
+                self.y, self.X, self.Wis, self.W, self.rho - self.rho_tolerance, self.n_jobs,
+                True, self.max_iter, self.backfitting_tol
+            )
+            second = (ll1 - 2 * ll0 + ll2) / self.rho_tolerance**2
+
+            if second <= 0 or not np.isfinite(second):
+                self.se_rho = np.nan
+                self.wald_z = np.nan
+                self.wald_p_rho = np.nan
+            else:
+                self.se_rho = np.sqrt(1 / second)
+                self.wald_z = self.rho / self.se_rho
+                self.wald_p_rho = 2 * (1 - norm.cdf(abs(self.wald_z)))
+
+            ll_full = self.loglik
+            ll_restricted = -estimate_log_likelihood(
+                self.y, self.X, self.Wis, self.W, 0, self.n_jobs,
+                True, self.max_iter, self.backfitting_tol
+            )
+            self.lr = 2 * (ll_full - ll_restricted)
+            self.lr_pvalue = 1.0 - chi2.cdf(self.lr, df=1)
+
+            self.lm, self.lm_pvalue = self._compute_lm_test()
+
+            self.ENP_j, self.critical_t_j, self.alpha_adj_j, self.df_j = self._compute_adjusted_t_values()
+            
+            self.leverage = np.diag(self.S)
+            self.studentized_residuals = self.residuals.ravel() / np.sqrt(
+                self.sigma2 * np.maximum(1.0 - self.leverage, 1e-12)
+            )
+            self.cooks_distance = (
+                self.studentized_residuals**2
+                * np.maximum(self.leverage, 1e-12)
+                / (self.p * (1.0 - np.maximum(self.leverage, 1e-12)))
+            )
+    def _compute_spillovers(self):
+        '''
+        Compute direct, indirect, and total spatial effects for each
+        local coefficient.
+
+        The spatial multiplier is defined as
+
+            (I - rho W)^(-1)
+
+        and the marginal effect matrix for coefficient j is
+
+            (I - rho W)^(-1) @ diag(beta_j).
+
+        For each coefficient, the reported effects are:
+
+        Direct effect
+            Mean of the diagonal elements of the marginal effect matrix.
+
+        Total effect
+            Mean of all elements of the marginal effect matrix.
+
+        Indirect effect
+            Total effect minus direct effect.
+
+        Returns
+        -------
+        dict
+            Dictionary containing direct, indirect, and total effects.
+        '''
+        multiplier = np.linalg.inv(self.I - self.rho * self.W)
+
+        direct = np.zeros(self.p)
+        indirect = np.zeros(self.p)
+        total = np.zeros(self.p)
+
+        effects = []
+
+        for j in range(self.p):
+            beta_j = np.asarray(self.betas[:, j]).ravel()
+            B_j = np.diag(beta_j)
+            M_j = np.dot(multiplier, B_j)
+            direct_j = np.mean(np.diag(M_j))
+            total_j = np.mean(np.sum(M_j, axis=1))
+
+            indirect_j = (total_j - direct_j)
+
+            direct[j] = direct_j
+            total[j] = total_j
+            indirect[j] = indirect_j
+
+            effects.append(M_j)
+
+        self.direct_effects = direct
+        self.indirect_effects = indirect
+        self.total_effects = total
+        self.effects = effects
+
+    def fit(
+        self, coords, y, X, W=None, bandwidths=None, variable_names=None, 
+        bandwidth_interval=None, alpha=None, rho_tolerance=1.e-5, 
+        backfitting_tol=1.e-5, max_iter=100
+    ):
+        '''
+        Fit the Multiscale Geographically Weighted Regression
+        Spatial Lag model.
+
+        Parameters
+        ----------
+        coords : ndarray of shape (n, 2)
+            Geographic coordinates of the observations.
+
+        y : ndarray of shape (n,)
+            Response variable.
+
+        X : ndarray of shape (n, p)
+            Matrix of explanatory variables. If `intercept=True`, a column of ones is
+            automatically added.
+
+        W : ndarray or libpysal.weights.W, optional
+            Spatial weights matrix used in the spatial lag model. Required when
+            `use_coords=False`.
+
+        bandwidth : int or float, optional
+            Kernel bandwidth. If None, the bandwidth is selected automatically.
+
+        variable_names : list of str, optional
+            Names of the explanatory variables used in the model summary.
+
+        bandwidth_interval : tuple, list, or None, optional
+            Lower and upper bounds for bandwidth selection. Must contain exactly two
+            values.
+
+        alpha : int or float, optional
+            critical value to determine which t-values are associated with statistically 
+            significant parameter estimates. Default to None in which case the adjusted
+            alpha value at the 95 percent CI is automatically used.
+
+        rho_tolerance : float, default=1e-5
+            Numerical tolerance used when optimizing the spatial autoregressive
+            parameter.
+
+        backfitting_tol : float, default=1.e-5
+            Convergence tolerance for MGWR backfitting.
+
+        max_iter : int, default=100
+            Maximum number of backfitting iterations.
+
+        Returns
+        -------
+        None
+        '''
+
+        self.coords = np.asarray(coords)
+        self.y = np.asarray(y)
+        self.X = np.asarray(X)
+
+        if (len(self.coords) != len(self.y)) or (len(self.coords) != len(self.X)):
+            raise ValueError('coords must be the same length as X and y')
+        if len(self.X) != len(self.y):
+            raise ValueError('X and y must be the same length')
+        if self.coords.shape[1] != 2:
+            raise ValueError('coords must have exactly two coordinates')
+
+        self.rho_tolerance = rho_tolerance
+        self.alpha = alpha
+        self.W = W
+        self.bandwidth_interval = bandwidth_interval
+        self.backfitting_tol = backfitting_tol
+        self.max_iter = max_iter
+
+        if self.intercept:
+            self.X = add_intercept(self.X)
+        self.n = self.X.shape[0]
+        self.p = self.X.shape[1]
+        self.I = np.identity(self.n)
+
+        self.variable_names = get_variable_names(variable_names, self.p, self.intercept)
+
+        if bandwidths is None:
+            self.bandwidths = self._select_bandwidth()
+        else:
+            self.bandwidths = validate_bandwidth(bandwidths, self.fixed, self.n, self.p, multi=True)
+
+        if self.distance_matrix is None:
+            if self.verbose:
+                print('Compute distance matrix')
+            self.Kernel = Kernel(
+                self.coords, 1, function=self.kernel, 
+                fixed=self.fixed, spherical=self.spherical
+            )
+            self.distance_matrix = self.Kernel.compute_distance_matrix()
+        
+        self.Wis = self._compute_variable_weights(self.bandwidths)
+        self.W = get_W(W, self.Wis, self.use_coords, self.n)
+
+        if self.family == 'gaussian':
+            self.rho = estimate_rho(
+                self.y, self.X, self.Wis, self.W, self.n_jobs, rho_tolerance=self.rho_tolerance, 
+                multi=True, max_iter=self.max_iter, backfitting_tol=self.backfitting_tol
+            )
+            self.y_star = get_y_star(self.y, self.W, self.rho)
+            if self.verbose:
+                print('Estimating MGWR local coefficients')
+            self.betas = estimate_mgwr_betas(
+                self.y, self.X, self.Wis, self.max_iter, self.backfitting_tol, self.n_jobs
+            )
+            self.y_hat = np.array([
+                np.dot(self.X[i], self.betas[i]) for i in range(self.n)
+            ]).reshape(-1, 1)
+            self.residuals = self.y_star - self.y_hat
+            self._compute_diagnostics()
+            if self.compute_deep_statistics:
+                self.local_ts, self.local_ps = self._compute_local_stastics()
+                self._compute_spillovers()
+        else:
+            raise ValueError('Unsupported family type', self.family)
+
+    def predict(self, coords_new=None, X_new=None):
+        '''
+        Predict fitted values from a fitted model.
+
+        Parameters
+        ----------
+        coords_new : ndarray of shape (m, 2), optional
+            Coordinates for new prediction locations. If None, in-sample fitted
+            values are returned.
+
+        X_new : ndarray of shape (m, p), optional
+            Design matrix for new observations. Required when coords_new is not None.
+
+        Returns
+        -------
+        ndarray
+            Predicted values. Shape is (n,) for in-sample prediction and (m,) for
+            out-of-sample prediction.
+
+        Raises
+        ------
+        ValueError
+            If model has not been fitted yet.
+
+        ValueError
+            If coords_new or X_new was not provided.
+
+        ValueError
+            If coords_new and X_new have different shapes.
+        '''
+
+        if not hasattr(self, 'betas'):
+            raise ValueError('Model has not been fitted yet.')
+        if coords_new is None and X_new is None:
+            return self.y_hat.ravel()
+        if coords_new is None or X_new is None:
+            raise ValueError('coords_new and X_new must both be provided for prediction.')
+        if coords_new.shape[0] != X_new.shape[0]:
+            raise ValueError('coords_new and X_new must have the same number of observations.')
+
+        coords_new = np.asarray(coords_new)
+        X_new = np.asarray(X_new)
+
+        if X_new.ndim == 1:
+            X_new = X_new.reshape(-1,self.p - int(self.intercept))
+        if self.intercept:
+            X_new = self._add_intercept(X_new)
+
+        m = coords_new.shape[0]
+        predictions = np.zeros(m)
+
+        for j in range(self.p):
+            kernel = Kernel(
+                self.coords, self.bandwidths[j], function=self.kernel, 
+                fixed=self.fixed, spherical=self.spherical
+            )
+
+            kernel.compute_distance_matrix(coords_new=coords_new)
+
+            Xj = self.X[:, j]
+            for i in range(m):
+                w = np.diag(kernel.get_Wi(i))
+
+                denominator = np.sum(w * Xj ** 2)
+
+                if denominator <= 1e-12:
+                    beta_ij = np.mean(self.betas[:, j])
+                else:
+                    partial_residual = (
+                        self.y_star.ravel()
+                        - np.sum(self.X * self.betas, axis=1)
+                        + Xj * self.betas[:, j]
+                    )
+                    numerator = np.sum(w * Xj * partial_residual)
+
+                    beta_ij = numerator / denominator
+
+                predictions[i] += X_new[i, j] * beta_ij
+
+        return predictions
+
+    def compute_local_collinearity(self, collinearity_bandwidth=None):
+        '''
+        Compute local multicollinearity diagnostics.
+
+        Computes, for each regression location:
+
+        - local correlation coefficients,
+        - local variance inflation factors (VIF),
+        - local condition numbers,
+        - local variance-decomposition proportions.
+
+        Returns
+        -------
+        local_corr : ndarray, shape (n, p, p)
+            Local correlation matrices.
+
+        local_vif : ndarray, shape (n, p)
+            Local variance inflation factors.
+
+        local_cn : ndarray, shape (n,)
+            Local condition numbers.
+
+        local_vdp : ndarray, shape (n, p, p)
+            Local variance-decomposition proportions.
+
+        Raises
+        ------
+        ValueError
+            If model has not been fitted yet.
+        '''
+
+        if not hasattr(self, 'Wis'):
+            raise ValueError('Model has not been fitted yet.')
+
+        if collinearity_bandwidth is None:
+            collinearity_bandwidth = np.max(self.bandwidths)
+
+        collinearity_kernel = Kernel(
+            self.coords,
+            collinearity_bandwidth,
+            function=self.kernel,
+            fixed=self.fixed,
+            spherical=self.spherical
+        )
+
+        collinearity_kernel.distance_matrix = self.distance_matrix
+
+        local_corr = np.zeros((self.n, self.p, self.p))
+        local_vif = np.zeros((self.n, self.p))
+        local_cn = np.zeros(self.n)
+        local_vdp = np.zeros((self.n, self.p, self.p))
+
+
+        for i in range(self.n):
+            Wi = collinearity_kernel.get_Wi(i)
+            w = np.diag(Wi)
+            w = np.maximum(w, 0.0)
+
+            sqrt_w = np.sqrt(w)
+
+            Xw = self.X * sqrt_w[:, None]
+
+            weight_sum = np.sum(w)
+
+            if weight_sum <= 1e-12:
+                local_corr[i] = np.nan
+                local_vif[i] = np.nan
+                local_cn[i] = np.nan
+                local_vdp[i] = np.nan
+                continue
+
+            weighted_mean = (np.sum(self.X * w[:, None], axis=0) / weight_sum)
+
+            X_centered = (self.X - weighted_mean)
+            Xw_centered = (X_centered * sqrt_w[:, None])
+
+            covariance = (np.dot(Xw_centered.T, Xw_centered)) / weight_sum
+
+            std = np.sqrt(np.maximum(np.diag(covariance), 1e-12))
+            local_corr[i] = (covariance / np.outer(std, std))
+
+            local_corr[i] = np.clip(local_corr[i], -1.0, 1.0)
+
+            for j in range(self.p):
+                y_j = Xw[:, j]
+                X_minus_j = np.delete(Xw, j, axis=1)
+
+                if X_minus_j.shape[1] == 0:
+                    local_vif[i, j] = 1.0
+                    continue
+
+                beta, _, _, _ = np.linalg.lstsq(X_minus_j, y_j, rcond=None)
+                y_hat = np.dot(X_minus_j, beta)
+                residual = y_j - y_hat
+                rss = np.sum(residual ** 2)
+                y_mean = np.average(self.X[:, j], weights=w)
+                tss = np.sum(w * (self.X[:, j] - y_mean) ** 2)
+
+                if tss <= 1e-12:
+                    r2 = 0.0
+                else:
+                    r2 = (1.0 - rss / tss)
+
+                r2 = np.clip(r2, 0.0, 1.0 - 1e-12)
+                local_vif[i, j] = 1.0 / (1.0 - r2)
+
+            X_standardized = X_centered / std
+            Xw_standardized = X_standardized * sqrt_w[:, None]
+            XtWX = np.dot(Xw_standardized.T, Xw_standardized)
+            XtWX = (XtWX + XtWX.T) / 2.0
+            eigvals, eigvecs = np.linalg.eigh(XtWX)
+            eigvals = np.maximum(eigvals, 1e-12)
+            local_cn[i] = np.sqrt(eigvals.max() / eigvals.min())
+
+            phi = (eigvecs ** 2) / eigvals[None, :]
+            denominator = np.sum(phi, axis=1, keepdims=True)
+
+            local_vdp[i] = (phi / np.maximum(denominator, 1e-12))
+
+        self.collinearity_bandwidth = collinearity_bandwidth
+
+        self.local_corr = local_corr
+        self.local_vif = local_vif
+        self.local_cn = local_cn
+        self.local_vdp = local_vdp
+
+        return local_corr, local_vif, local_cn, local_vdp
+
+    def monte_carlo_test(self, n_perm=100, random_state=None):
+        '''
+        Monte Carlo test for spatial variability of local coefficients.
+
+        Parameters
+        ----------
+        n_perm : int, default=99
+            Number of random permutations.
+
+        random_state : int, optional
+            Seed for the random number generator.
+
+        Returns
+        -------
+        pvalues : ndarray, shape (p,)
+            Monte Carlo p-values for each coefficient surface.
+
+        observed : ndarray, shape (p,)
+            Observed variances of the local coefficients.
+
+        simulated : ndarray, shape (n_perm, p)
+            Simulated variances from the permutations.
+        
+        Raises
+        ------
+        ValueError
+            If model has not been fitted yet.
+        '''
+
+        rng = np.random.default_rng(random_state)
+
+        if not hasattr(self, 'betas'):
+            raise ValueError('Model has not been fitted yet.')
+
+        observed = np.std(self.betas, axis=0)
+        simulated = np.zeros((n_perm, self.p))
+        verbose = self.verbose
+        self.verbose = False
+
+        for r in tqdm(range(n_perm), total=n_perm, desc='permutations: '):
+            coords_perm = self.coords[rng.permutation(self.n)]
+            model = deepcopy(self)
+            model.distance_matrix = None 
+
+            model.fit(
+                coords_perm,
+                self.y,
+                self.X,
+                bandwidths=self.bandwidths,
+                W=self.W,
+                rho_tolerance=self.rho_tolerance
+            )
+
+            simulated[r] = np.std(model.betas, axis=0)
+
+        pvalues = (np.sum(simulated >= observed, axis=0)) / float(n_perm)
+
+        self.verbose = verbose
+        self.mc_observed = observed
+        self.mc_simulated = simulated
+        self.mc_pvalues = pvalues
+
+        return pvalues
+
+    def summary(self):
+        '''
+        Return a formatted summary of the fitted GWR-SL model.
+
+        Returns
+        -------
+        str
+            Model summary.
+        '''
+
+        lines = []
+
+        def section(title):
+            lines.append('')
+            lines.append(title)
+            lines.append('-' * 104)
+
+        def two_col(left_label, left_value, right_label='', right_value=''):
+            lines.append(
+                f'{left_label:<34}{left_value:>16}'
+                f'    '
+                f'{right_label:<34}{right_value:>16}'
+            )
+
+        lines.append('=' * 104)
+        lines.append('Geographically Weighted Regression - Spatial Lag model')
+        lines.append('=' * 104)
+
+        section('Model Information')
+        bw = f'{"Fixed" if self.fixed else "Adaptive"}'
+        two_col('Number of observations', self.n,
+                'Number of predictors', self.p)
+        two_col('Kernel', self.kernel,
+                'Bandwidth type', bw)
+
+        section('Model Diagnostics')
+        two_col('Residual sum of squares', f'{self.rss:.6f}',
+                'Sigma²', f'{self.sigma2:.6f}')
+        two_col('Log-likelihood', f'{self.loglik:.6f}',
+                'AIC', f'{self.aic:.6f}')
+        two_col('AICc', f'{self.aicc:.6f}',
+                'BIC', f'{self.bic:.6f}')
+        two_col('R²', f'{self.r2:.6f}',
+                'Adjusted R²', f'{self.adj_r2:.6f}')
+        two_col('trace(S)', f'{self.trace_S:.6f}',
+                'Degrees of freedom', f'{self.df:.6f}')
+
+        section('Residual Diagnostics')
+
+        two_col('Mean residual', f'{np.mean(self.residuals):.6f}',
+                'Std. residual', f'{np.std(self.residuals, ddof=1):.6f}')
+        two_col('Mean leverage', f'{np.mean(self.leverage):.6f}',
+                'Maximum leverage', f'{np.max(self.leverage):.6f}')
+        two_col('Mean Cook\'s distance', f'{np.mean(self.cooks_distance):.6f}',
+                'Maximum Cook\'s distance', f'{np.max(self.cooks_distance):.6f}')
+        two_col('Mean |studentized residual|', f'{np.mean(np.abs(self.studentized_residuals)):.6f}',
+                'Maximum |studentized residual|', f'{np.max(np.abs(self.studentized_residuals)):.6f}'
+        )
+
+        section('Statistics for Local Coefficients')
+
+        lines.append(
+            f'{"Variable":<29}'
+            f'{"Bandwidth":>15}'
+            f'{"DF":>15}'
+            f'{"ENP":>15}'
+            f'{"Adj t-value":>15}'
+            f'{"Adj alpha":>15}'
+        )
+
+        lines.append('-' * 104)
+
+        for j, name in enumerate(self.variable_names):
+            lines.append(
+                f'{name:<29}'
+                f'{self.bandwidths[j]:15.6f}'
+                f'{self.df_j[j]:15.6f}'
+                f'{self.ENP_j[j]:15.6f}'
+                f'{self.critical_t_j[j]:15.6f}'
+                f'{self.alpha_adj_j[j]:15.6f}'
+            )
+
+        section('Summary Statistics for Local Coefficients')
+
+        lines.append(
+            f'{"Variable":<29}'
+            f'{"Mean":>15}'
+            f'{"Std":>15}'
+            f'{"Min":>15}'
+            f'{"Median":>15}'
+            f'{"Max":>15}'
+        )
+
+        lines.append('-' * 104)
+
+        for j, name in enumerate(self.variable_names):
+            beta = self.betas[:, j]
+            lines.append(
+                f'{name:<29}'
+                f'{np.mean(beta):15.6f}'
+                f'{np.std(beta, ddof=1):15.6f}'
+                f'{np.min(beta):15.6f}'
+                f'{np.median(beta):15.6f}'
+                f'{np.max(beta):15.6f}'
+            )
+
+        section('Statistics for autoregressive coefficient ρ')
+        two_col('Value', f'{self.rho:.6f}',
+                'Standard error', f'{self.se_rho:.6f}')
+        two_col('Wald test z-statistic', f'{self.wald_z:.6f}',
+                'Wald test p-value', f'{self.wald_p_rho:.6f}')
+        two_col('Likelihood ratio', f'{self.lr:.6f}',
+                'Likelihood ratio p-value', f'{self.lr_pvalue:.6f}')
         two_col('Lagrange Multiplier statistic', f'{self.lm:.6f}',
                 'Lagrange Multiplier p-value', f'{self.lm_pvalue:.6f}')
 
